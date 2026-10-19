@@ -58,7 +58,7 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.collotsspot.ensemble"
+        applicationId "com.collotsspot.ensemble.imagefix"
         minSdkVersion flutter.minSdkVersion
         targetSdk 35
         versionCode flutterVersionCode.toInteger()
