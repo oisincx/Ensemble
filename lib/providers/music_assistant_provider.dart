@@ -2903,8 +2903,13 @@ class MusicAssistantProvider with ChangeNotifier {
 
           Map<String, dynamic>? metadata;
           if (imageUrl != null) {
+            // MA 2.8+ sends `<stream server>/imageproxy/<id>?size=...`. Keep the id
+            // so getImageUrl() can rebuild it against our own connection URL;
+            // the stream server port is often unreachable from the phone.
+            final proxyId = MusicAssistantAPI.extractImageProxyId(imageUrl);
             var finalImageUrl = imageUrl;
-            if (_serverUrl != null) {
+            if (proxyId == null && _serverUrl != null) {
+              // Legacy `/imageproxy?provider=&path=` URL from an older server
               try {
                 final imgUri = Uri.parse(imageUrl);
                 final queryString = imgUri.query;
@@ -2922,7 +2927,12 @@ class MusicAssistantProvider with ChangeNotifier {
             }
             metadata = {
               'images': [
-                {'path': finalImageUrl, 'provider': 'direct'}
+                {
+                  'path': finalImageUrl,
+                  'provider': 'direct',
+                  'type': 'thumb',
+                  if (proxyId != null) 'proxy_id': proxyId,
+                }
               ]
             };
           }
@@ -3144,7 +3154,11 @@ class MusicAssistantProvider with ChangeNotifier {
       }
       artist ??= 'Unknown Artist';
 
-      if (imageUrl != null && _serverUrl != null) {
+      final notificationProxyId = imageUrl != null ? MusicAssistantAPI.extractImageProxyId(imageUrl) : null;
+      if (notificationProxyId != null && _api != null) {
+        // MA 2.8+ id-based URL: rebuild against our own connection URL
+        imageUrl = _api!.buildImageProxyUrl(notificationProxyId, size: 512);
+      } else if (imageUrl != null && _serverUrl != null) {
         try {
           final imgUri = Uri.parse(imageUrl);
           final queryString = imgUri.query;

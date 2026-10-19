@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:crypto/crypto.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:uuid/uuid.dart';
@@ -3250,42 +3251,36 @@ class MusicAssistantAPI {
     return streamUrl;
   }
 
-  // Get image URL
-  String? getImageUrl(MediaItem item, {int size = 256}) {
-    // Images are in metadata.images as an array
-    final images = item.metadata?['images'] as List<dynamic>?;
-    if (images == null || images.isEmpty) {
-      return null;
+  // Sizes accepted by the MA imageproxy (0 = original). Any other size is
+  // rejected with HTTP 400 by servers since API schema 31.
+  static const _allowedImageSizes = [80, 160, 256, 512, 1024];
+  static final _imageProxyIdPattern = RegExp(r'/imageproxy/([0-9a-fA-F]{64})');
+
+  /// Round a requested thumbnail size up to the nearest size the server accepts
+  static int snapImageSize(int size) {
+    if (size <= 0) return 0;
+    for (final allowed in _allowedImageSizes) {
+      if (size <= allowed) return allowed;
     }
+    return _allowedImageSizes.last;
+  }
 
-    // Try to find a non-remotely accessible image first (prefer local/opensubsonic)
-    Map<String, dynamic>? selectedImage;
-    for (var img in images) {
-      final imgMap = img as Map<String, dynamic>;
-      final provider = imgMap['provider'] as String?;
+  /// Extract the opaque image id from a server-generated `/imageproxy/<id>` URL
+  static String? extractImageProxyId(String url) =>
+      _imageProxyIdPattern.firstMatch(url)?.group(1)?.toLowerCase();
 
-      // Prefer opensubsonic images over spotify/remote
-      if (provider != null && provider.startsWith('opensubsonic')) {
-        selectedImage = imgMap;
-        break;
-      }
-    }
+  /// Whether the server serves the id-based `/imageproxy/<proxy_id>` endpoint.
+  /// The legacy `/imageproxy?provider=&path=` form was removed server-side in
+  /// mid 2026, so when the schema is not known yet assume a modern server.
+  bool get _supportsImageProxyIds => _schemaVersion == null || _schemaVersion! >= 31;
 
-    // If no opensubsonic image, use first image
-    if (selectedImage == null) {
-      selectedImage = images.first as Map<String, dynamic>;
-    }
+  /// Build an imageproxy URL for a server-issued image id
+  String buildImageProxyUrl(String proxyId, {int size = 256}) {
+    return '${_httpBaseUrl()}/imageproxy/$proxyId?size=${snapImageSize(size)}&fmt=jpeg';
+  }
 
-    final imagePath = selectedImage['path'] as String?;
-    if (imagePath == null) return null;
-
-    // ALWAYS use imageproxy endpoint to ensure images route through MA server
-    // This fixes images not loading when connecting via external domain:
-    // - Direct URLs may contain internal IPs not reachable from outside the network
-    // - Streaming service URLs (Spotify, Tidal) may require auth or have CORS issues
-    // - MA's imageproxy fetches the image server-side and serves it through your server
-
-    // Build the imageproxy URL
+  /// HTTP base URL of the MA webserver (scheme, host and port, no trailing slash)
+  String _httpBaseUrl() {
     var baseUrl = serverUrl;
     var useSecure = true;
 
@@ -3302,22 +3297,69 @@ class MusicAssistantAPI {
 
     if (_cachedCustomPort != null) {
       // Use cached custom port from settings
-      baseUrl = '${uri.scheme}://${uri.host}:$_cachedCustomPort';
+      return '${uri.scheme}://${uri.host}:$_cachedCustomPort';
     } else if (!uri.hasPort) {
-      if (useSecure) {
-        // For HTTPS, don't add port 443 (it's the default)
-        baseUrl = '${uri.scheme}://${uri.host}';
-      } else {
-        // For HTTP, default to Music Assistant port 8095
-        baseUrl = '${uri.scheme}://${uri.host}:8095';
-      }
-    } else {
-      baseUrl = '${uri.scheme}://${uri.host}:${uri.port}';
+      // For HTTPS, don't add port 443 (it's the default)
+      // For HTTP, default to Music Assistant port 8095
+      return useSecure ? '${uri.scheme}://${uri.host}' : '${uri.scheme}://${uri.host}:8095';
+    }
+    return '${uri.scheme}://${uri.host}:${uri.port}';
+  }
+
+  // Get image URL
+  String? getImageUrl(MediaItem item, {int size = 256}) {
+    // Images are in metadata.images as an array
+    final images = (item.metadata?['images'] as List<dynamic>?)
+        ?.whereType<Map<String, dynamic>>()
+        .toList();
+    if (images == null || images.isEmpty) {
+      return null;
     }
 
-    final provider = selectedImage['provider'] as String?;
-    // Use the imageproxy endpoint
-    return '$baseUrl/imageproxy?provider=${Uri.encodeComponent(provider ?? "")}&size=$size&fmt=jpeg&path=${Uri.encodeComponent(imagePath)}';
+    // Only thumbs are cover art; fanart/logo/banner images have other aspect
+    // ratios. Fall back to any image if the item has no thumb.
+    final thumbs = images.where((img) => (img['type'] ?? 'thumb') == 'thumb').toList();
+    final candidates = thumbs.isNotEmpty ? thumbs : images;
+
+    // Prefer opensubsonic images over spotify/remote
+    final selectedImage = candidates.firstWhere(
+      (img) => (img['provider'] as String?)?.startsWith('opensubsonic') ?? false,
+      orElse: () => candidates.first,
+    );
+
+    final imagePath = selectedImage['path'] as String?;
+    if (imagePath == null || imagePath.isEmpty) return null;
+    final provider = selectedImage['provider'] as String? ?? '';
+
+    // ALWAYS route images through the MA imageproxy:
+    // - Direct URLs may contain internal IPs not reachable from outside the network
+    // - Streaming service URLs (Spotify, Tidal) may require auth or have CORS issues
+    // - The proxy resizes, so we don't download full-size artwork for thumbnails
+
+    // Server-issued id (MA 2.8+), or one extracted from a ready-made proxy URL
+    var proxyId = selectedImage['proxy_id'] as String?;
+    if (proxyId == null && provider == 'direct') {
+      proxyId = extractImageProxyId(imagePath);
+    }
+
+    if (proxyId != null) {
+      return buildImageProxyUrl(proxyId, size: size);
+    }
+
+    if (provider == 'direct') {
+      // Already a complete URL built by the app (e.g. from player events)
+      return imagePath;
+    }
+
+    if (_supportsImageProxyIds) {
+      // Items cached before the server upgrade have no proxy_id. The server
+      // derives it deterministically, so compute the same id locally.
+      final computedId = sha256.convert(utf8.encode('$provider/$imagePath')).toString();
+      return buildImageProxyUrl(computedId, size: size);
+    }
+
+    // Legacy endpoint for servers older than API schema 31
+    return '${_httpBaseUrl()}/imageproxy?provider=${Uri.encodeComponent(provider)}&size=${snapImageSize(size)}&fmt=jpeg&path=${Uri.encodeComponent(imagePath)}';
   }
 
   // ==================== iTunes Artwork Lookup ====================
